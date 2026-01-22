@@ -1,0 +1,308 @@
+name: Quality Gateway CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+env:
+  JAVA_VERSION: '17'
+  COVERAGE_THRESHOLD: 80
+
+jobs:
+  # Job 1: Build and Smoke Tests (Fast feedback on PRs)
+  smoke-tests:
+    name: Build & Smoke Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+        
+      - name: ☕ Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+          
+      - name: 🔨 Build Application
+        run: mvn clean compile -B
+        
+      - name: 🧪 Run Smoke Tests
+        run: mvn test -Dgroups=smoke -B
+        continue-on-error: false
+        
+      - name: 📊 Generate Test Report
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: Smoke Test Results
+          path: target/surefire-reports/*.xml
+          reporter: java-junit
+          fail-on-error: true
+          
+      - name: ❌ Quality Gate 1 - Critical Test Failure
+        if: failure()
+        run: |
+          echo "::error::❌ QUALITY GATE FAILED: Critical smoke tests failed!"
+          echo "::error::Pipeline stopped - smoke tests must pass before proceeding"
+          exit 1
+
+  # Job 2: Full Regression Tests (Only if smoke tests pass)
+  regression-tests:
+    name: Full Regression Suite
+    runs-on: ubuntu-latest
+    needs: smoke-tests
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+        
+      - name: ☕ Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+          
+      - name: 🔨 Build Application
+        run: mvn clean compile -B
+        
+      - name: 🧪 Run Full Regression Tests
+        run: mvn test -Dgroups=regression -B
+        
+      - name: 📊 Generate Test Report
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: Regression Test Results
+          path: target/surefire-reports/*.xml
+          reporter: java-junit
+          
+      - name: 📤 Upload Test Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-test-reports
+          path: |
+            target/surefire-reports/
+            target/site/
+          retention-days: 30
+
+  # Job 3: Code Coverage & Quality Gate
+  code-coverage:
+    name: Code Coverage Analysis
+    runs-on: ubuntu-latest
+    needs: smoke-tests
+    
+    steps:
+      - name: 📥 Checkout Code
+        uses: actions/checkout@v4
+        
+      - name: ☕ Setup Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+          
+      - name: 🔨 Build and Run Tests with Coverage
+        run: mvn clean verify -DtestGroups=regression -B
+        
+      - name: 📊 Generate Coverage Report
+        run: mvn jacoco:report -B
+        
+      - name: 📈 Extract Coverage Percentage
+        id: coverage
+        run: |
+          # Extract coverage from JaCoCo report
+          COVERAGE=$(awk -F"," '{ instructions += $4 + $5; covered += $5 } END { print int(100*covered/instructions) }' target/site/jacoco/jacoco.csv)
+          echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
+          echo "📊 Code Coverage: $COVERAGE%"
+          
+      - name: ✅ Quality Gate 2 - Coverage Threshold Check
+        run: |
+          COVERAGE=${{ steps.coverage.outputs.coverage }}
+          echo "📊 Current Coverage: $COVERAGE%"
+          echo "🎯 Required Coverage: ${{ env.COVERAGE_THRESHOLD }}%"
+          
+          if [ "$COVERAGE" -lt "${{ env.COVERAGE_THRESHOLD }}" ]; then
+            echo "::error::❌ QUALITY GATE FAILED: Code coverage ($COVERAGE%) is below threshold (${{ env.COVERAGE_THRESHOLD }}%)"
+            echo "::error::Please add more tests to improve coverage"
+            exit 1
+          else
+            echo "::notice::✅ QUALITY GATE PASSED: Code coverage ($COVERAGE%) meets threshold (${{ env.COVERAGE_THRESHOLD }}%)"
+          fi
+          
+      - name: 📤 Upload Coverage Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-reports
+          path: |
+            target/site/jacoco/
+            target/jacoco.exec
+          retention-days: 30
+          
+      - name: 💬 Comment Coverage on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const coverage = ${{ steps.coverage.outputs.coverage }};
+            const threshold = ${{ env.COVERAGE_THRESHOLD }};
+            const status = coverage >= threshold ? '✅ PASSED' : '❌ FAILED';
+            const emoji = coverage >= threshold ? '🎉' : '⚠️';
+            
+            const comment = `## ${emoji} Code Coverage Report
+            
+            **Status:** ${status}
+            **Coverage:** ${coverage}%
+            **Threshold:** ${threshold}%
+            
+            ${coverage >= threshold ? 
+              '✅ Coverage meets the quality gate threshold!' : 
+              '❌ Coverage is below the quality gate threshold. Please add more tests.'}
+            
+            [View detailed coverage report in artifacts](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+  # Job 4: Notifications
+  notify:
+    name: Send Notifications
+    runs-on: ubuntu-latest
+    needs: [smoke-tests, code-coverage]
+    if: always()
+    
+    steps:
+      - name: 📧 Determine Status
+        id: status
+        run: |
+          if [ "${{ needs.smoke-tests.result }}" == "failure" ]; then
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "message=Smoke tests failed" >> $GITHUB_OUTPUT
+          elif [ "${{ needs.code-coverage.result }}" == "failure" ]; then
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "message=Code coverage below threshold" >> $GITHUB_OUTPUT
+          else
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "message=All quality gates passed" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: 📢 Slack Notification (Failure)
+        if: steps.status.outputs.status == 'failure'
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "text": "❌ Quality Gateway CI/CD Failed",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "❌ Build Failed - Quality Gate"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Repository:*\n${{ github.repository }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Branch:*\n${{ github.ref_name }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Triggered by:*\n${{ github.actor }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Reason:*\n${{ steps.status.outputs.message }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View Build"
+                      },
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+        continue-on-error: true
+          
+      - name: 📢 Slack Notification (Success)
+        if: steps.status.outputs.status == 'success'
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          payload: |
+            {
+              "text": "✅ Quality Gateway CI/CD Passed",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "✅ Build Successful - All Quality Gates Passed"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Repository:*\n${{ github.repository }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Branch:*\n${{ github.ref_name }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Triggered by:*\n${{ github.actor }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+        continue-on-error: true
+          
+      - name: 📝 Job Summary
+        run: |
+          echo "## 🎯 Quality Gateway CI/CD Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Status:** ${{ steps.status.outputs.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Message:** ${{ steps.status.outputs.message }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Job Results:" >> $GITHUB_STEP_SUMMARY
+          echo "- Smoke Tests: ${{ needs.smoke-tests.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Code Coverage: ${{ needs.code-coverage.result }}" >> $GITHUB_STEP_SUMMARY
+
