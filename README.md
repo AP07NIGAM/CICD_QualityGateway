@@ -383,11 +383,6 @@ public void testApiEndpoint() { }
    - Verify secrets are configured (SLACK_WEBHOOK_URL)
    - Ensure branch protection rules allow workflow
 
-## 📜 License
 
-This project is for educational and demonstration purposes.
 
----
-
-**Built with ❤️ to demonstrate Quality Gateway CI/CD practices**
 
